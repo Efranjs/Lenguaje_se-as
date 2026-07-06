@@ -1,0 +1,91 @@
+services:
+  # ─────────────────────────────────────────────
+  # BASE DE DATOS (PostgreSQL)
+  # Actualmente independiente del backend.
+  # Conectar cuando necesites persistir datos
+  # (historial, imágenes, sesiones, etc.)
+  # ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: signai
+      POSTGRES_PASSWORD: signai_pass
+      POSTGRES_DB: signai_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Scripts SQL que se ejecutan al crear la DB por primera vez
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U signai -d signai_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # ADMIN VISUAL DE LA DB (opcional, solo dev)
+  # Abre http://localhost:5050 en el navegador
+  # Login: admin@signai.dev / admin
+  # ─────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@signai.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "5050:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # ─────────────────────────────────────────────
+  # BACKEND (FastAPI + ML)
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./vendors:/app/vendors:ro
+      - ./data:/app/data
+    environment:
+      - LSP_VENDOR_DIR=/app/vendors/modelo_lstm_lsp
+      - CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+      # DB lista para conectar cuando quieras (descomenta en config.py o .env)
+      - DATABASE_URL=postgresql://signai:signai_pass@db:5432/signai_db
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # FRONTEND (Vite / React)
+  # ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────
+# VOLÚMENES PERSISTENTES
+# Los datos de la DB sobreviven a docker-compose down
+# ─────────────────────────────────────────────
+volumes:
+  postgres_data:
+  pgadmin_data:

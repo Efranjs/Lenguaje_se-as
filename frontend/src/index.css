@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* Paleta minimal: navy, blanco, gris claro */
+@theme {
+  --color-navy: #152238;
+  --color-navy-deep: #0d1520;
+  --color-navy-muted: #1e2f45;
+  --color-surface: #ffffff;
+  --color-canvas: #f4f5f7;
+  --color-canvas-muted: #e8eaef;
+  --color-text: #1a2332;
+  --color-text-secondary: #5c6b7a;
+  --color-text-on-navy: #f8fafc;
+  --color-text-muted-on-navy: #94a3b8;
+  --color-accent: #243b53;
+  --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background-color: var(--color-canvas);
+  -webkit-font-smoothing: antialiased;
+}

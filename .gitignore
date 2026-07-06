@@ -1,0 +1,40 @@
+# Datos y modelos (no versionar)
+data/
+docs/
+*.h5
+*.keras
+*.zip
+*.rar
+*.7z
+
+# Entornos Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.Python
+*.egg-info/
+.eggs/
+
+# Variables de entorno
+.env
+.env.local
+backend/.env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Vendors (repos clonados — opcional: quitar esta línea si usas submódulos)
+vendors/
+
+# IDE / OS / tooling
+.antigravitycli/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

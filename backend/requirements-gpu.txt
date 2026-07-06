@@ -1,0 +1,3 @@
+# Tras requirements.txt, ejecutar scripts/setup-gpu.ps1 (recomendado)
+# o: pip uninstall -y tensorflow tensorflow-intel && pip install -r requirements-gpu.txt
+tensorflow[and-cuda]==2.15.1
