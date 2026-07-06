@@ -76,11 +76,10 @@ class DecisionEngine:
         # Ordenar clases por probabilidad descendente para podar más rápido.
         ranked_indices = np.argsort(probs)[::-1]
 
-        # El adversario (ruido) inyecta incertidumbre: resta tolerance a cada prob.
+        # El adversario (ruido) inyecta incertidumbre: resta la misma tolerancia a cada prob
+        # para evitar sesgar o penalizar de forma fija a ciertas clases.
         noisy_probs = probs.copy()
-        noise = np.random.default_rng(42).uniform(
-            0, self.noise_tolerance, size=len(noisy_probs)
-        )
+        noise = np.full(len(noisy_probs), self.noise_tolerance)
         noisy_probs = np.clip(noisy_probs - noise, 0.0, 1.0)
 
         # Alfa: mejor valor encontrado por Max (la mejor predicción).

@@ -230,3 +230,15 @@ export async function fetchAgentOrient(wordIds, apiUrl = getApiBaseUrl()) {
   if (!res.ok) return { available: false, orientations: [] };
   return res.json();
 }
+
+export async function fetchAdminDeleteWord(wordId, apiUrl = getApiBaseUrl()) {
+  const res = await fetch(`${apiUrl}/admin/words/${encodeURIComponent(wordId)}`, {
+    method: 'DELETE',
+    credentials: CREDS,
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(detail || 'Error al eliminar palabra');
+  }
+  return res.json();
+}

@@ -72,6 +72,7 @@ class SessionState:
     count_frame: int = 0
     fix_frames: int = 0
     recording: bool = False
+    cooldown: bool = False
 
 
 class LspEngine:
@@ -130,8 +131,8 @@ class LspEngine:
             "model_complexity": settings.mediapipe_model_complexity,
             "smooth_landmarks": True,
             "refine_face_landmarks": False,
-            "min_detection_confidence": 0.5,
-            "min_tracking_confidence": 0.5,
+            "min_detection_confidence": 0.7,
+            "min_tracking_confidence": 0.7,
         }
         self.frame_max_width = settings.frame_max_width
         self.skip_if_busy = settings.inference_skip_if_busy
@@ -216,11 +217,32 @@ class LspEngine:
         return self.model is not None
 
     def get_labels(self) -> list[dict[str, str]]:
+        n_model_classes = 0
+        if self.model is not None:
+            try:
+                n_model_classes = int(self.model.output_shape[-1])
+            except Exception:
+                n_model_classes = 0
+        vendor_dir = Path(settings.lsp_vendor_dir)
+        samples_root = vendor_dir / "frame_actions"
         labels = []
-        for word_id in self.word_ids:
+        for idx, word_id in enumerate(self.word_ids):
             base_id = word_id.split("-")[0]
             label = self.display_map.get(base_id, base_id.replace("_", " ").upper())
-            labels.append({"id": word_id, "label": label})
+            trained = idx < n_model_classes
+            samples_count = 0
+            word_dir = samples_root / word_id
+            if word_dir.is_dir():
+                samples_count = sum(
+                    1 for c in word_dir.iterdir()
+                    if c.is_dir() and c.name.startswith("sample_")
+                )
+            labels.append({
+                "id": word_id,
+                "label": label,
+                "trained": trained,
+                "samples_count": samples_count,
+            })
         return labels
 
     def _get_session(self, session_id: str) -> SessionState:
@@ -302,23 +324,44 @@ class LspEngine:
         self._ensure_holistic()
         results = self.mediapipe_detection(frame, self.holistic)
         hands = self.there_hand(results)
-        last_word: dict[str, Any] | None = None
+        last_word = None
+        realtime_pred = None
 
-        if hands or state.recording:
+        # --- COOLDOWN: tras una predicción, exigir que las manos bajen ---
+        if state.cooldown:
+            if not hands:
+                state.cooldown = False
+            # Mientras esté en cooldown, no acumular frames ni predecir
+        elif hands:
             state.recording = False
+            state.fix_frames = 0
             state.count_frame += 1
             if state.count_frame > self.margin_frame:
                 state.kp_seq.append(self.extract_keypoints(results))
             if state.count_frame >= self.max_sequence_frames:
-                last_word = self._finalize_sequence(state, threshold, trim_delay=True)
+                last_word = self._finalize_sequence(state, threshold)
+                if last_word is not None:
+                    state.cooldown = True  # esperar a que bajen las manos
+            else:
+                realtime_pred = self._get_realtime_prediction(state.kp_seq)
         else:
-            if state.count_frame >= self._min_capture_frames:
+            if state.count_frame > 0:
                 state.fix_frames += 1
                 if state.fix_frames < self.delay_frames:
                     state.recording = True
+                    realtime_pred = self._get_realtime_prediction(state.kp_seq)
                 else:
-                    last_word = self._finalize_sequence(state, threshold, trim_delay=True)
-            if not state.recording:
+                    if len(state.kp_seq) >= self.min_length_frames:
+                        last_word = self._finalize_sequence(state, threshold)
+                        if last_word is not None:
+                            state.cooldown = True
+                    else:
+                        state.recording = False
+                        state.fix_frames = 0
+                        state.count_frame = 0
+                        state.kp_seq = []
+            else:
+                state.recording = False
                 state.fix_frames = 0
                 state.count_frame = 0
                 state.kp_seq = []
@@ -330,6 +373,7 @@ class LspEngine:
             "model_loaded": self.model_loaded,
             "landmarks": self._hand_landmarks_from_results(results),
             "last_prediction": last_word,
+            "realtime_prediction": realtime_pred,
             "capture": self._capture_status(state, hands),
             "message": None
             if self.model_loaded
@@ -350,7 +394,9 @@ class LspEngine:
     def _capture_status(self, state: SessionState, hands: bool) -> dict[str, Any]:
         frames = state.count_frame
         min_f = self._min_capture_frames
-        if not hands and frames == 0:
+        if state.cooldown:
+            hint = "Baja las manos para iniciar la siguiente seña"
+        elif not hands and frames == 0:
             hint = "Haz la seña con ambas manos visibles en el cuadro"
         elif hands and frames < min_f:
             hint = f"Sostén la seña ({frames}/{min_f} frames)…"
@@ -371,11 +417,8 @@ class LspEngine:
         self,
         state: SessionState,
         threshold: float,
-        *,
-        trim_delay: bool,
     ) -> dict[str, Any] | None:
-        tail = (self.margin_frame + self.delay_frames) if trim_delay else self.margin_frame
-        kp_seq = state.kp_seq[: -tail] if len(state.kp_seq) > tail else list(state.kp_seq)
+        kp_seq = list(state.kp_seq)
         last_word = self._predict_kp_sequence(kp_seq, state, threshold)
         state.recording = False
         state.fix_frames = 0
@@ -398,6 +441,14 @@ class LspEngine:
             res = self._predict_batch(batch)[0].numpy()
         else:
             res = self.model.predict(batch, verbose=0)[0]
+
+        # --- LOG TEMPORAL: ver predicciones crudas ---
+        top5_idx = np.argsort(res)[::-1][:5]
+        top5_str = ", ".join(f"{self.word_ids[int(i)].split('-')[0]}={res[int(i)]:.3f}" for i in top5_idx)
+        _logger.warning(
+            "PREDICCION CRUDAS: kp_seq_len=%d kp_norm_shape=%s | top5: %s",
+            len(kp_seq), np.array(kp_normalized).shape, top5_str,
+        )
 
         # --- MOTOR DE DECISIÓN: Minimax + Poda Alfa-Beta ---
         decision = self.decision_engine.evaluate(res, threshold=threshold)
@@ -437,6 +488,28 @@ class LspEngine:
 
     def _predict_sequence(self, state: SessionState, threshold: float) -> dict[str, Any] | None:
         return self._predict_kp_sequence(state.kp_seq, state, threshold)
+
+    def _get_realtime_prediction(self, kp_seq: list) -> dict[str, Any] | None:
+        if not self.model or len(kp_seq) < self.min_length_frames:
+            return None
+
+        kp_normalized = self.normalize_keypoints(kp_seq, self.model_frames)
+        batch = np.expand_dims(kp_normalized, axis=0).astype(np.float32)
+        if self._predict_batch is not None:
+            res = self._predict_batch(batch)[0].numpy()
+        else:
+            res = self.model.predict(batch, verbose=0)[0]
+
+        best_idx = int(np.argmax(res))
+        confidence = float(res[best_idx])
+        word_id = self.word_ids[best_idx].split("-")[0]
+        label = self.decision_engine.display_map.get(word_id, word_id.replace("_", " ").upper())
+
+        return {
+            "word_id": word_id,
+            "label": label,
+            "confidence": round(confidence * 100, 2),
+        }
 
     def reset_session(self, session_id: str = "default") -> None:
         self.sessions.pop(session_id, None)

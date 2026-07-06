@@ -64,5 +64,8 @@ orientacion_ciudadano(atencion_general, 'Por favor acerquese a la mesa de partes
     \+ orientacion_ciudadano(atencion_general, _).
 
 % --- CONSULTA PRINCIPAL ---
+% Devuelve una sola solucion por cada par (Area, Mensaje) distinto,
+% evitando duplicados cuando hay varios hechos sena_detectada(X) iguales.
 consultar_orientacion(Area, Mensaje) :-
-    orientacion_ciudadano(Area, Mensaje).
+    setof(Area-Mensaje, orientacion_ciudadano(Area, Mensaje), Pares),
+    member(Area-Mensaje, Pares).

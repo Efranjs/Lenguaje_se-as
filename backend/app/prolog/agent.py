@@ -1,96 +1,74 @@
-"""Agente de razonamiento organizacional basado en Prolog.
-
-Integra SWI-Prolog via PySwip para inferir orientaciones municipales
-a partir de las señas detectadas por el modelo LSTM.
-"""
-
-from __future__ import annotations
-
+import subprocess
+import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
 _logger = logging.getLogger("signai.backend")
 
-_KB_PATH = Path(__file__).parent / "knowledge_base.pl"
-
-
 class PrologAgent:
-    """Agente que razona sobre las señas detectadas usando Prolog."""
+    """Agente que razona sobre las señas detectadas ejecutando Prolog en un subproceso seguro."""
 
     def __init__(self) -> None:
-        try:
-            from pyswip import Prolog
-
-            self._prolog = Prolog()
-            self._prolog.consult(str(_KB_PATH))
-            self._available = True
-            _logger.info("Agente Prolog inicializado: %s", _KB_PATH)
-        except Exception as exc:
-            _logger.warning("Prolog no disponible: %s", exc)
-            self._prolog = None
-            self._available = False
+        self._available = True
+        self._python = sys.executable or "python"
+        self._cli_path = Path(__file__).resolve().parent / "query_cli.py"
+        _logger.info("Agente Prolog inicializado en modo subproceso seguro.")
 
     @property
     def available(self) -> bool:
         return self._available
 
     def clear_session(self) -> None:
-        """Limpia las señas detectadas de la sesión anterior."""
-        if not self._available:
-            return
-        try:
-            list(self._prolog.query("limpiar_sesion."))
-        except Exception as exc:
-            _logger.warning("Error al limpiar sesión Prolog: %s", exc)
+        # No-op en modo subproceso síncrono, se limpia en cada llamada
+        pass
 
     def assert_sign(self, word_id: str) -> None:
-        """Inserta un hecho dinámico: sena_detectada(<word_id>)."""
-        if not self._available:
-            return
-        safe = word_id.strip().lower().replace("-", "_").replace(" ", "_")
-        if not safe.isidentifier():
-            _logger.warning("Identificador Prolog inválido: %s", word_id)
-            return
-        try:
-            self._prolog.assertz(f"sena_detectada({safe})")
-        except Exception as exc:
-            _logger.warning("Error al assertar seña %s: %s", safe, exc)
+        # No-op en modo subproceso síncrono
+        pass
 
     def query_orientation(self) -> list[dict[str, str]]:
-        """Consulta todas las orientaciones que aplican a las señas actuales."""
-        if not self._available:
-            return []
-        try:
-            results = list(self._prolog.query("consultar_orientacion(Area, Mensaje)"))
-            orientations: list[dict[str, str]] = []
-            for r in results:
-                area = str(r.get("Area", ""))
-                mensaje = str(r.get("Mensaje", ""))
-                if area and mensaje:
-                    orientations.append({"area": area, "message": mensaje})
-            return orientations
-        except Exception as exc:
-            _logger.warning("Error al consultar orientación: %s", exc)
-            return []
+        # No-op en modo subproceso síncrono
+        return []
 
     def process_signs(self, word_ids: list[str]) -> dict[str, Any]:
-        """Flujo completo: limpia, asserta señas y consulta orientación."""
-        if not self._available:
-            return {"available": False, "orientations": []}
+        """Flujo completo: ejecuta el subproceso para evaluar las señas."""
+        if not self._available or not word_ids:
+            return {"available": self._available, "orientations": []}
 
-        self.clear_session()
-        for wid in word_ids:
-            self.assert_sign(wid)
+        try:
+            # Filtrar y limpiar identificadores válidos
+            cleaned_words = []
+            for wid in word_ids:
+                safe = wid.strip().lower().replace("-", "_").replace(" ", "_")
+                if safe.isidentifier():
+                    cleaned_words.append(safe)
 
-        orientations = self.query_orientation()
-        self.clear_session()
+            if not cleaned_words:
+                return {"available": True, "orientations": []}
 
-        return {
-            "available": True,
-            "signs_asserted": word_ids,
-            "orientations": orientations,
-        }
+            # Ejecutar el script CLI en un proceso independiente
+            args = [self._python, str(self._cli_path), ",".join(cleaned_words)]
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                return {
+                    "available": True,
+                    "signs_asserted": word_ids,
+                    "orientations": data.get("orientations", []),
+                }
+            else:
+                _logger.warning("Prolog CLI falló con código %d: %s", proc.returncode, proc.stderr)
+        except Exception as exc:
+            _logger.warning("Error al ejecutar consulta Prolog en subproceso: %s", exc)
+
+        return {"available": True, "orientations": []}
 
 
 _agent: PrologAgent | None = None

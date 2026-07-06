@@ -208,7 +208,7 @@ def admin_add_word(body: dict, user: UserModel = Depends(_require_admin)):
         if f'"{word_id}"' not in const_text:
             const_text = const_text.rstrip()
             if const_text.endswith("}"):
-                const_text = const_text[:-1].rstrip().rstrip(",") + "\n" + entry + "\n}"
+                const_text = const_text[:-1].rstrip().rstrip(",") + ",\n" + entry + "\n}"
             constants_path.write_text(const_text, "utf-8")
 
     try:
@@ -226,6 +226,73 @@ def admin_list_words(user: UserModel = Depends(_require_admin)):
     return {"words": labels}
 
 
+@app.delete("/admin/words/{word_id}")
+def admin_delete_word(word_id: str, user: UserModel = Depends(_require_admin)):
+    word_id = word_id.strip()
+    if not word_id:
+        raise HTTPException(status_code=400, detail="word_id requerido")
+
+    vendor_dir = Path(settings.lsp_vendor_dir)
+
+    # 1. Update words.json
+    words_json = vendor_dir / "models" / "words.json"
+    if words_json.exists():
+        try:
+            data = json.loads(words_json.read_text("utf-8"))
+            if word_id in data.get("word_ids", []):
+                data["word_ids"].remove(word_id)
+                words_json.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        except Exception as e:
+            logger.warning("Error updating words.json during delete: %s", e)
+
+    # 2. Update labels.json
+    labels_json = vendor_dir.parent.parent / "data" / "models" / "labels.json"
+    if labels_json.exists():
+        try:
+            labels_data = json.loads(labels_json.read_text("utf-8"))
+            if word_id in labels_data.get("word_ids", []):
+                labels_data["word_ids"].remove(word_id)
+            if word_id in labels_data.get("display", {}):
+                labels_data["display"].pop(word_id)
+            labels_json.write_text(json.dumps(labels_data, ensure_ascii=False), "utf-8")
+        except Exception as e:
+            logger.warning("Error updating labels.json during delete: %s", e)
+
+    # 3. Update constants.py
+    constants_path = vendor_dir / "constants.py"
+    if constants_path.exists():
+        try:
+            const_text = constants_path.read_text("utf-8")
+            lines = const_text.splitlines()
+            new_lines = [line for line in lines if f'"{word_id}"' not in line]
+            constants_path.write_text("\n".join(new_lines) + "\n", "utf-8")
+        except Exception as e:
+            logger.warning("Error updating constants.py during delete: %s", e)
+
+    # 4. Delete frame_actions folder and keypoints .h5 file
+    import shutil
+    frame_actions_dir = vendor_dir / "frame_actions" / word_id
+    if frame_actions_dir.exists() and frame_actions_dir.is_dir():
+        try:
+            shutil.rmtree(frame_actions_dir)
+        except Exception as e:
+            logger.warning("Error deleting frame_actions folder: %s", e)
+
+    h5_file = vendor_dir.parent.parent / "data" / "keypoints" / f"{word_id}.h5"
+    if h5_file.exists():
+        try:
+            h5_file.unlink()
+        except Exception as e:
+            logger.warning("Error deleting h5 file: %s", e)
+
+    try:
+        _reload_engine()
+    except Exception as exc:
+        logger.warning("Engine reload after word delete: %s", exc)
+
+    return {"word_id": word_id, "ok": True}
+
+
 @app.post("/capture/save")
 def capture_save(body: dict, user: UserModel = Depends(_require_admin)):
     word_id = body.get("word_id")
@@ -241,6 +308,8 @@ def capture_save(body: dict, user: UserModel = Depends(_require_admin)):
     saved = 0
     for i, b64 in enumerate(frames_b64):
         try:
+            if "," in b64:
+                b64 = b64.split(",", 1)[-1]
             raw = base64.b64decode(b64)
             dst = sample_dir / f"{i + 1}.jpg"
             dst.write_bytes(raw)
@@ -570,6 +639,7 @@ async def websocket_detect(websocket: WebSocket) -> None:
     session_id = websocket.query_params.get("session_id", "ws-default")
     try:
         engine = get_engine()
+        engine.reset_session(session_id)
     except FileNotFoundError as exc:
         await websocket.send_json({"type": "error", "message": str(exc)})
         await websocket.close()
@@ -596,6 +666,17 @@ async def websocket_detect(websocket: WebSocket) -> None:
                 continue
 
             threshold = payload.get("threshold")
+            if TRAINING_RUNNING:
+                await websocket.send_json({
+                    "type": "result",
+                    "hands_detected": False,
+                    "model_loaded": False,
+                    "sentence": [],
+                    "realtime_prediction": None,
+                    "skipped": True,
+                })
+                continue
+
             result = engine.process_frame(
                 image,
                 session_id=session_id,

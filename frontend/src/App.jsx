@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpen,
   Camera,
@@ -18,6 +18,9 @@ import {
 import {
   captureFrameFromVideo,
   createDetectWebSocket,
+  fetchAdminAddWord,
+  fetchAdminDeleteWord,
+  fetchCaptureSave,
   fetchHealth,
   fetchHistory,
   fetchLabels,
@@ -148,6 +151,8 @@ function AppContent() {
 
   useEffect(() => {
     refreshBackendStatus();
+    const id = setInterval(refreshBackendStatus, 5000);
+    return () => clearInterval(id);
   }, [refreshBackendStatus]);
 
   const updateSetting = (key, value) => {
@@ -330,7 +335,7 @@ function AppContent() {
         )}
 
         {activeView === 'vocabulario' && (
-          <VocabularioView apiUrl={apiUrl} />
+          <VocabularioView apiUrl={apiUrl} user={user} />
         )}
 
         {activeView === 'login' && !user && (
@@ -371,12 +376,12 @@ function DetectionView({
 }) {
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const [trainStatus, setTrainStatus] = useState(null);
-  const [trainingLog, setTrainingLog] = useState([]);
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
   const streamRef = useRef(null);
   const wsRef = useRef(null);
   const [sentence, setSentence] = useState([]);
+  const [realtimePrediction, setRealtimePrediction] = useState(null);
   const [words, setWords] = useState([]);
   const [cameraError, setCameraError] = useState(null);
   const [handsDetected, setHandsDetected] = useState(false);
@@ -388,16 +393,38 @@ function DetectionView({
   const [localHandsDetected, setLocalHandsDetected] = useState(false);
   const [handTrackerStatus, setHandTrackerStatus] = useState({ phase: 'idle' });
   const [cameras, setCameras] = useState([]);
-  const [selectedCameraId, setSelectedCameraId] = useState(null);
+  const [selectedCameraId, setSelectedCameraId] = useState(() => {
+    return localStorage.getItem('selectedCameraId') || null;
+  });
   const [orientations, setOrientations] = useState([]);
   const [decisionReasoning, setDecisionReasoning] = useState(null);
+
+  const [trainMode, setTrainMode] = useState('idle');
+  const [trainWordId, setTrainWordId] = useState('');
+  const [trainLabels, setTrainLabels] = useState([]);
+  const [trainCountdown, setTrainCountdown] = useState(0);
+  const [trainFrameCount, setFrameCount] = useState(0);
+  const [trainError, setTrainError] = useState(null);
+  const [trainNewLabel, setTrainNewLabel] = useState('');
+  const [trainNewBusy, setTrainNewBusy] = useState(false);
+  const trainRecordingRef = useRef(false);
+  const trainRecorderRef = useRef(null);
+  const trainTimeoutRef = useRef(null);
+  const trainFramesRef = useRef([]);
+
+  const isTrainingRef = useRef(false);
+  isTrainingRef.current = trainMode !== 'idle' || (trainStatus?.running === true);
 
   useEffect(() => {
     navigator.mediaDevices.enumerateDevices().then((devices) => {
       const videoDevices = devices.filter((d) => d.kind === 'videoinput');
       setCameras(videoDevices);
-      if (videoDevices.length > 0 && !selectedCameraId) {
+      const savedCameraId = localStorage.getItem('selectedCameraId');
+      if (savedCameraId && videoDevices.some((d) => d.deviceId === savedCameraId)) {
+        setSelectedCameraId(savedCameraId);
+      } else if (videoDevices.length > 0) {
         setSelectedCameraId(videoDevices[0].deviceId);
+        localStorage.setItem('selectedCameraId', videoDevices[0].deviceId);
       }
     });
   }, []);
@@ -435,6 +462,7 @@ function DetectionView({
   const applyResult = useCallback(
     (data) => {
       if (data.sentence) setSentence(data.sentence);
+      setRealtimePrediction(data.realtime_prediction || null);
       if (data.words) {
         const mapped = data.words.map((w) => ({
           word: w.label,
@@ -596,6 +624,10 @@ function DetectionView({
 
     const tick = async () => {
       if (cancelled) return;
+      if (trainRecordingRef.current || isTrainingRef.current) {
+        scheduleNext(500);
+        return;
+      }
       const video = videoRef.current;
       if (!video || video.videoWidth === 0) {
         scheduleNext(150);
@@ -667,16 +699,93 @@ function DetectionView({
         ? 'Sin rostro/manos'
         : '';
 
-  const startTraining = async () => {
-    setTrainingLog([]);
+  const loadTrainLabels = useCallback(async () => {
     try {
-      const data = await fetchTrainStart(apiUrl);
-      setTrainStatus(data);
-      setTrainingLog(['Entrenamiento iniciado…']);
+      const d = await fetchLabels(apiUrl);
+      const list = d.labels || [];
+      setTrainLabels(list);
+      if (list.length && !trainWordId) setTrainWordId(list[0].id);
+    } catch { /* ignore */ }
+  }, [apiUrl, trainWordId]);
+
+  const handleAddTrainWord = useCallback(async () => {
+    const display = trainNewLabel.trim().toUpperCase();
+    if (!display) { setTrainError('Escribe el nombre de la seña'); return; }
+    const id = display.toLowerCase().replace(/\s+/g, '_');
+    setTrainNewBusy(true);
+    setTrainError(null);
+    try {
+      await fetchAdminAddWord(id, display, apiUrl);
+      const d = await fetchLabels(apiUrl);
+      const list = d.labels || [];
+      setTrainLabels(list);
+      setTrainWordId(id);
+      setTrainNewLabel('');
     } catch (err) {
-      setTrainingLog([`Error: ${err.message}`]);
+      setTrainError(`Error al agregar palabra: ${err.message}`);
+    } finally {
+      setTrainNewBusy(false);
     }
-  };
+  }, [apiUrl, trainNewLabel]);
+
+  const cancelTrainingFlow = useCallback(() => {
+    if (trainRecorderRef.current) { clearInterval(trainRecorderRef.current); trainRecorderRef.current = null; }
+    if (trainTimeoutRef.current) { clearTimeout(trainTimeoutRef.current); trainTimeoutRef.current = null; }
+    trainRecordingRef.current = false;
+    trainFramesRef.current = [];
+    setTrainMode('idle');
+    setTrainCountdown(0);
+    setFrameCount(0);
+  }, []);
+
+  const startTrainingFlow = useCallback(async (wordId) => {
+    console.log("startTrainingFlow", { wordId, isCameraOn, videoReady });
+    if (!wordId) { setTrainError('Selecciona una seña'); return; }
+    if (!isCameraOn) { setTrainError('Enciende la cámara primero'); return; }
+    setTrainError(null);
+    setTrainMode('countdown');
+    setTrainCountdown(3);
+    for (let n = 3; n > 0; n--) {
+      await new Promise((r) => setTimeout(r, 1000));
+      setTrainCountdown((c) => Math.max(0, c - 1));
+    }
+    await new Promise((r) => setTimeout(r, 600));
+    setTrainMode('recording');
+    trainRecordingRef.current = true;
+    trainFramesRef.current = [];
+    setFrameCount(0);
+    trainRecorderRef.current = setInterval(() => {
+      const video = videoRef.current;
+      if (!video || video.videoWidth === 0) return;
+      const f = captureFrameFromVideo(video, 0.7, captureMaxWidth);
+      if (!f) return;
+      trainFramesRef.current.push(f.split(',')[1]);
+      setFrameCount(trainFramesRef.current.length);
+    }, 100);
+    trainTimeoutRef.current = setTimeout(async () => {
+      if (trainRecorderRef.current) { clearInterval(trainRecorderRef.current); trainRecorderRef.current = null; }
+      trainRecordingRef.current = false;
+      const fr = trainFramesRef.current;
+      trainFramesRef.current = [];
+      setTrainMode('saving');
+      try {
+        await fetchCaptureSave(wordId, fr, apiUrl);
+      } catch (err) {
+        setTrainError(`Error al guardar: ${err.message}`);
+        setTrainMode('idle');
+        return;
+      }
+      setTrainMode('training');
+      try {
+        await fetchTrainStart(apiUrl);
+      } catch (err) {
+        setTrainError(`Error al entrenar: ${err.message}`);
+      }
+      setTrainMode('idle');
+    }, 10000);
+  }, [apiUrl, captureMaxWidth, isCameraOn, videoReady]);
+
+  useEffect(() => () => cancelTrainingFlow(), [cancelTrainingFlow]);
 
   useEffect(() => {
     if (!user?.isAdmin) return;
@@ -684,10 +793,6 @@ function DetectionView({
       try {
         const data = await fetchTrainStatus(apiUrl);
         setTrainStatus(data);
-        if (data?.message) {
-          const lines = data.message.split('\n');
-          setTrainingLog(prev => (prev.length === lines.length ? prev : lines));
-        }
       } catch { /* ignore */ }
     }, 3000);
     return () => clearInterval(id);
@@ -701,7 +806,9 @@ function DetectionView({
             <select
               value={selectedCameraId || ''}
               onChange={(e) => {
-                setSelectedCameraId(e.target.value);
+                const id = e.target.value;
+                setSelectedCameraId(id);
+                localStorage.setItem('selectedCameraId', id);
                 streamRef.current?.getTracks().forEach((t) => t.stop());
                 streamRef.current = null;
                 setVideoReady(false);
@@ -744,6 +851,42 @@ function DetectionView({
                 <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
                 Rec
               </div>
+
+              {trainMode === 'countdown' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-navy-deep/40 pointer-events-none">
+                  <p className="text-xs font-mono uppercase tracking-widest text-white/80 mb-3">Prepárate…</p>
+                  <span className="text-7xl font-bold text-white tabular-nums drop-shadow-lg">
+                    {trainCountdown > 0 ? trainCountdown : '¡ya!'}
+                  </span>
+                </div>
+              )}
+              {trainMode === 'recording' && (
+                <>
+                  <div className="absolute top-4 right-4 z-20 flex items-center gap-2 bg-red-600 text-white text-xs font-semibold px-3 py-1.5 rounded-full">
+                    <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
+                    GRABANDO · {trainFrameCount} frames
+                  </div>
+                  <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-white/20 z-20">
+                    <div className="h-full bg-red-600 transition-all" style={{ width: `${Math.min(100, (trainFrameCount / 100) * 100)}%` }} />
+                  </div>
+                </>
+              )}
+              {trainMode === 'saving' && (
+                <div className="absolute inset-0 flex items-center justify-center z-20 bg-navy-deep/50 pointer-events-none">
+                  <div className="flex flex-col items-center gap-2 text-white">
+                    <div className="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    <p className="text-sm font-medium">Guardando {trainFrameCount} frames…</p>
+                  </div>
+                </div>
+              )}
+              {trainMode === 'training' && (
+                <div className="absolute inset-0 flex items-center justify-center z-20 bg-navy-deep/50 pointer-events-none">
+                  <div className="flex flex-col items-center gap-2 text-white">
+                    <div className="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    <p className="text-sm font-medium">Entrenando modelo…</p>
+                  </div>
+                </div>
+              )}
 
               {showDebugOverlay && (
                 <div className="absolute top-16 right-4 text-text-on-navy text-xs font-mono uppercase tracking-widest z-10 text-right max-w-[50%]">
@@ -834,27 +977,104 @@ function DetectionView({
           </button>
 
           {user?.isAdmin && (
-            <div className="relative">
-              {trainStatus?.running ? (
-                <div className="flex items-center gap-2 text-xs text-navy font-medium px-3 py-2 bg-navy/5 rounded-lg">
-                  <span className="w-2 h-2 bg-navy rounded-full animate-pulse" />
-                  Entrenando…
-                </div>
-              ) : (
-                <button type="button" onClick={startTraining}
+            <div className="relative flex items-center gap-2">
+              {trainError && (
+                <span className="text-xs text-red-600 max-w-[180px] leading-tight">{trainError}</span>
+              )}
+              {trainMode === 'idle' && !trainStatus?.running && (
+                <button type="button"
+                  onClick={async () => { await loadTrainLabels(); setTrainMode('selecting'); setTrainError(null); }}
                   className="text-xs font-medium text-text-on-navy bg-navy hover:bg-navy-muted px-3 py-2 rounded-lg transition-colors whitespace-nowrap">
                   Entrenar
                 </button>
               )}
-              {trainingLog.length > 0 && !trainStatus?.running && (
-                <div className="absolute bottom-full right-0 mb-2 z-20 w-80 max-h-48 overflow-y-auto bg-surface border border-canvas-muted rounded-xl shadow-lg p-3">
-                  <pre className="text-[11px] text-text-secondary font-mono whitespace-pre-wrap">
-                    {trainingLog.map((l, i) => <div key={i}>{l}</div>)}
-                  </pre>
-                  <button type="button" onClick={() => setTrainingLog([])}
-                    className="mt-2 text-xs text-text-secondary hover:text-text underline">
-                    Cerrar
+              {trainMode === 'selecting' && (
+                <>
+                  <select
+                    value={trainWordId === '__new__' ? '__new__' : trainWordId}
+                    onChange={(e) => {
+                      if (e.target.value === '__new__') {
+                        setTrainWordId('__new__');
+                      } else {
+                        setTrainWordId(e.target.value);
+                        setTrainNewLabel('');
+                      }
+                    }}
+                    className="text-xs text-text bg-surface border border-canvas-muted rounded-lg px-2 py-2 outline-none max-w-[160px]">
+                    {!trainLabels.length && <option value="">— sin palabras —</option>}
+                    <option value="__new__" className="font-semibold text-navy">＋ Nueva palabra…</option>
+                    {trainLabels.map((w) => (
+                      <option key={w.id} value={w.id}>{w.label}</option>
+                    ))}
+                  </select>
+
+                  {trainWordId === '__new__' && (() => {
+                    const newId = trainNewLabel.trim().toLowerCase().replace(/\s+/g, '_');
+                    const dup = newId && trainLabels.some((w) => w.id === newId);
+                    return (
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            value={trainNewLabel}
+                            onChange={(e) => setTrainNewLabel(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter' && !trainNewBusy && !dup) handleAddTrainWord(); }}
+                            placeholder="Ej: GRACIAS"
+                            disabled={trainNewBusy}
+                            className={`text-xs text-text bg-canvas border rounded-lg px-2 py-2 outline-none w-[120px] uppercase ${dup ? 'border-red-400 focus:border-red-500' : 'border-canvas-muted focus:border-navy'}`}
+                          />
+                          <button type="button" onClick={handleAddTrainWord} disabled={trainNewBusy || !trainNewLabel.trim() || dup}
+                            className="text-xs font-medium text-text-on-navy bg-navy hover:bg-navy-muted disabled:opacity-50 px-2 py-2 rounded-lg transition-colors whitespace-nowrap">
+                            {trainNewBusy ? '…' : 'Agregar'}
+                          </button>
+                        </div>
+                        {dup && (
+                          <span className="text-[10px] text-red-600 leading-tight">
+                            Ya existe «{trainLabels.find((w) => w.id === newId)?.label}» — edítala desde Admin
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {trainWordId !== '__new__' && trainWordId && (
+                    <button type="button" onClick={() => startTrainingFlow(trainWordId)}
+                      className="text-xs font-medium text-text-on-navy bg-navy hover:bg-navy-muted px-3 py-2 rounded-lg transition-colors whitespace-nowrap">
+                      Iniciar
+                    </button>
+                  )}
+                  <button type="button" onClick={cancelTrainingFlow}
+                    className="text-xs text-text-secondary hover:text-text px-2 py-2">
+                    Cancelar
                   </button>
+                </>
+              )}
+              {trainMode === 'countdown' && (
+                <div className="text-xs text-navy font-medium px-3 py-2 bg-navy/5 rounded-lg">
+                  Prepárate… {trainCountdown || '¡ya!'}
+                </div>
+              )}
+              {trainMode === 'recording' && (
+                <div className="flex items-center gap-2 text-xs text-red-600 font-medium px-3 py-2 bg-red-50 rounded-lg">
+                  <span className="w-2 h-2 bg-red-600 rounded-full animate-pulse" />
+                  Grabando · {trainFrameCount} frames
+                </div>
+              )}
+              {trainMode === 'saving' && (
+                <div className="text-xs text-navy font-medium px-3 py-2 bg-navy/5 rounded-lg">
+                  Guardando {trainFrameCount} frames…
+                </div>
+              )}
+              {trainMode === 'training' && (
+                <div className="flex items-center gap-2 text-xs text-navy font-medium px-3 py-2 bg-navy/5 rounded-lg">
+                  <span className="w-2 h-2 bg-navy rounded-full animate-pulse" />
+                  Entrenando modelo…
+                </div>
+              )}
+              {trainMode === 'idle' && trainStatus?.running && (
+                <div className="flex items-center gap-2 text-xs text-navy font-medium px-3 py-2 bg-navy/5 rounded-lg">
+                  <span className="w-2 h-2 bg-navy rounded-full animate-pulse" />
+                  Entrenando…
                 </div>
               )}
             </div>
@@ -879,6 +1099,12 @@ function DetectionView({
                 <span className="inline-block w-0.5 h-7 ml-1 bg-navy animate-pulse align-middle" />
               )}
             </p>
+            {realtimePrediction && (
+              <div className="mt-4 p-4 bg-navy/5 border border-navy/15 rounded-xl flex items-center justify-between animate-pulse">
+                <span className="text-xs font-semibold text-navy uppercase tracking-wider">Prediciendo:</span>
+                <span className="text-sm font-bold text-text uppercase">{realtimePrediction.label} ({realtimePrediction.confidence}%)</span>
+              </div>
+            )}
             <div className="mt-auto" />
             {lastRejected && (
               <p className="text-xs text-amber-700 mt-3 leading-relaxed">{lastRejected}</p>
@@ -892,7 +1118,7 @@ function DetectionView({
                 haz la seña completa y baja las manos para confirmar.
               </p>
             )}
-            {backendStatus?.status !== 'ok' && (
+            {backendStatus && backendStatus.status !== 'ok' && (
               <p className="text-xs text-red-600 mt-3">
                 Inicia el backend: uvicorn app.main:app --reload (puerto 8000)
               </p>
@@ -1281,10 +1507,74 @@ function PhrasesView({ apiUrl, onTts }) {
   );
 }
 
-function VocabularioView({ apiUrl }) {
+const VOCABULARY_CATEGORIES = [
+  {
+    key: 'saludos',
+    title: 'Saludos y despedidas',
+    ids: ['adios', 'hola-der', 'hola-izq', 'buenos_dias', 'buenas_tardes', 'buenas_noches', 'hasta_luego', 'gusto_conocerte'],
+  },
+  {
+    key: 'cortesia',
+    title: 'Cortesía',
+    ids: ['gracias', 'por_favor', 'disculpa', 'me_ayudas', 'ayuda'],
+  },
+  {
+    key: 'afirmacion',
+    title: 'Afirmación y negación',
+    ids: ['si', 'no', 'tal_vez', 'bueno'],
+  },
+  {
+    key: 'estados',
+    title: 'Estados y emociones',
+    ids: ['bien', 'mal', 'mas_o_menos', 'feliz', 'triste', 'enojado', 'cansado', 'asustado'],
+  },
+  {
+    key: 'familia',
+    title: 'Familia y personas',
+    ids: ['mama', 'papa', 'hermano', 'amigo', 'bebe'],
+  },
+  {
+    key: 'necesidades',
+    title: 'Necesidades básicas',
+    ids: ['agua', 'comida', 'baño', 'casa'],
+  },
+  {
+    key: 'preguntas',
+    title: 'Preguntas',
+    ids: ['que', 'quien', 'donde', 'cuando', 'por_que', 'cuanto', 'como_estas'],
+  },
+  {
+    key: 'celebraciones',
+    title: 'Celebraciones',
+    ids: ['feliz_cumpleaños'],
+  },
+];
+
+function vocabCategoryFor(id) {
+  const base = id.split('-')[0];
+  for (const cat of VOCABULARY_CATEGORIES) {
+    if (cat.ids.includes(base)) return cat.key;
+  }
+  return 'otros';
+}
+
+function VocabularioView({ apiUrl, user }) {
   const [labels, setLabels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [collapsed, setCollapsed] = useState({});
+
+  const handleDeleteWord = async (wordId) => {
+    if (!window.confirm(`¿Estás seguro de que deseas eliminar la seña "${wordId}"? Esto borrará todas sus muestras y archivos de datos.`)) {
+      return;
+    }
+    try {
+      await fetchAdminDeleteWord(wordId, apiUrl);
+      setLabels((prev) => prev.filter((item) => item.id !== wordId));
+    } catch (err) {
+      alert(`Error al eliminar: ${err.message}`);
+    }
+  };
 
   useEffect(() => {
     fetchLabels(apiUrl).then((data) => {
@@ -1294,24 +1584,117 @@ function VocabularioView({ apiUrl }) {
     }).finally(() => setLoading(false));
   }, [apiUrl]);
 
+  const trainedCount = labels.filter((l) => l.trained).length;
+  const withSamplesCount = labels.filter((l) => (l.samples_count ?? 0) > 0).length;
+
+  const grouped = useMemo(() => {
+    const map = {};
+    for (const cat of VOCABULARY_CATEGORIES) map[cat.key] = { ...cat, items: [] };
+    map.otros = { key: 'otros', title: 'Otros', items: [] };
+    for (const item of labels) {
+      const key = vocabCategoryFor(item.id);
+      map[key].items.push(item);
+    }
+    return Object.values(map).filter((c) => c.items.length > 0);
+  }, [labels]);
+
+  const toggle = (key) => setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
+
   return (
     <div className="flex-1 overflow-y-auto bg-canvas px-6 py-8">
-      <p className="text-text-secondary text-sm mb-6">
-        Palabras que el sistema reconoce actualmente ({labels.length} señas).
+      <p className="text-text-secondary text-sm mb-2">
+        Vocabulario registrado: {labels.length} señas.
+      </p>
+      <p className="text-text-secondary text-xs mb-6">
+        <span className="text-navy font-semibold">{trainedCount}</span> entrenadas por el modelo ·{' '}
+        <span className="text-navy font-semibold">{withSamplesCount}</span> con muestras capturadas
       </p>
       {loading ? (
         <p className="text-text-secondary text-sm">Cargando vocabulario…</p>
       ) : error ? (
         <p className="text-red-600 text-sm">{error}</p>
       ) : (
-        <div className="border-y border-canvas-muted bg-surface divide-y divide-canvas-muted">
-          {labels.map((item) => (
-            <div key={item.id} className="px-5 py-4 flex items-center justify-between gap-4">
-              <span className="font-medium text-text">{item.label}</span>
-              <span className="text-xs font-mono text-text-secondary">{item.id}</span>
-            </div>
-          ))}
+        <div className="flex flex-col gap-4">
+          {grouped.map((cat) => {
+            const catTrained = cat.items.filter((i) => i.trained).length;
+            const collapsedNow = collapsed[cat.key];
+            return (
+              <div key={cat.key} className="bg-surface border border-canvas-muted rounded-xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => toggle(cat.key)}
+                  className="w-full flex items-center justify-between gap-4 px-5 py-3 hover:bg-canvas-muted/40 transition-colors"
+                >
+                  <div className="flex items-center gap-3">
+                    <ChevronLeft className={`w-4 h-4 text-text-secondary transition-transform ${collapsedNow ? '' : '-rotate-90'}`} />
+                    <h3 className="font-semibold text-text text-sm">{cat.title}</h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-text-secondary">{cat.items.length} señas</span>
+                    <span className="text-xs font-medium text-navy bg-navy/5 px-2 py-0.5 rounded-full">
+                      {catTrained}/{cat.items.length}
+                    </span>
+                  </div>
+                </button>
+                {!collapsedNow && (
+                  <div className="divide-y divide-canvas-muted border-t border-canvas-muted">
+                    {cat.items.map((item) => {
+                      const samples = item.samples_count ?? 0;
+                      return (
+                        <div key={item.id} className="px-5 py-3 flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <span className="font-medium text-text text-sm">{item.label}</span>
+                            {item.trained ? (
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-green-700 bg-green-50 border border-green-200 px-2 py-0.5 rounded-full shrink-0">
+                                Entrenada
+                              </span>
+                            ) : samples > 0 ? (
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full shrink-0">
+                                Con muestras
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-text-secondary bg-canvas-muted border border-canvas-muted px-2 py-0.5 rounded-full shrink-0">
+                                Sin entrenar
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-3 shrink-0">
+                            {samples > 0 && (
+                              <span className="text-xs text-text-secondary tabular-nums">
+                                {samples} muestra{samples === 1 ? '' : 's'}
+                              </span>
+                            )}
+                            <span className="text-xs font-mono text-text-secondary">{item.id}</span>
+                            {user?.isAdmin && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteWord(item.id)}
+                                className="text-red-500 hover:text-red-700 font-semibold text-xs bg-red-50 hover:bg-red-100/80 px-2 py-1 rounded transition-colors"
+                                title={`Eliminar ${item.label}`}
+                              >
+                                Borrar
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
+      )}
+      {!loading && !error && (
+        <p className="text-xs text-text-secondary mt-6 leading-relaxed">
+          Las señas marcadas como <span className="text-green-700 font-semibold">Entrenada</span> ya
+          pueden ser reconocidas por el modelo actual. Las marcadas como{' '}
+          <span className="text-amber-700 font-semibold">Con muestras</span> tienen grabaciones listas
+          para el próximo entrenamiento. Las marcadas como{' '}
+          <span className="font-semibold">Sin entrenar</span> aún no tienen muestras: usa el botón
+          «Entrenar» en el panel de Detección para capturarlas.
+        </p>
       )}
     </div>
   );

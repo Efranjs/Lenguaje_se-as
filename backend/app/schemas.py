@@ -19,6 +19,8 @@ class HealthResponse(BaseModel):
 class LabelItem(BaseModel):
     id: str
     label: str
+    trained: bool = False
+    samples_count: int = 0
 
 
 class LabelsResponse(BaseModel):

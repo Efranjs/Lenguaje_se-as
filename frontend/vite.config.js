@@ -6,12 +6,16 @@ import tailwindcss from '@tailwindcss/vite'
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   optimizeDeps: {
-    exclude: ['@mediapipe/tasks-vision'],
+    include: ['@mediapipe/tasks-vision'],
   },
-  // MediaPipe publica .map inexistente; no afecta la app, solo ensucia la consola
+  // MediaPipe publica .map inexistente; silenciamos el warning en dev
   server: {
     sourcemapIgnoreList(sourcePath) {
       return sourcePath.includes('@mediapipe');
     },
+    sourcemap: false,
+  },
+  build: {
+    sourcemap: false,
   },
 })

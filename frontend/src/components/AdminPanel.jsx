@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchAdminAddWord, fetchAdminListWords, fetchCaptureSamples, fetchCaptureSave, fetchLabels, fetchTrainStart, fetchTrainStatus } from '../api/lspClient';
+import { fetchAdminAddWord, fetchAdminDeleteWord, fetchAdminListWords, fetchCaptureSamples, fetchCaptureSave, fetchLabels, fetchTrainStart, fetchTrainStatus } from '../api/lspClient';
 
 export default function AdminPanel({ apiUrl }) {
   // Train
@@ -12,6 +12,7 @@ export default function AdminPanel({ apiUrl }) {
   const [selectedWord, setSelectedWord] = useState('');
   const [capturing, setCapturing] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [frameCount, setFrameCount] = useState(0);
   const [samples, setSamples] = useState([]);
   const [captureMsg, setCaptureMsg] = useState(null);
   const videoRef = useRef(null);
@@ -105,6 +106,7 @@ export default function AdminPanel({ apiUrl }) {
   const record = () => {
     if (!camReady || recording) return;
     framesRef.current = [];
+    setFrameCount(0);
     setRecording(true);
     setPreviewUrl(null);
     recorderRef.current = setInterval(() => {
@@ -115,6 +117,7 @@ export default function AdminPanel({ apiUrl }) {
       c.height = video.videoHeight;
       c.getContext('2d').drawImage(video, 0, 0);
       framesRef.current.push(c.toDataURL('image/jpeg', 0.7).split(',')[1]);
+      setFrameCount(framesRef.current.length);
     }, 100);
     setTimeout(() => stopRecord(), 5000);
   };
@@ -171,6 +174,28 @@ export default function AdminPanel({ apiUrl }) {
     }
   };
 
+  const handleDeleteWord = async (wordId) => {
+    if (!window.confirm(`¿Estás seguro de que deseas eliminar la seña "${wordId}"? Esto borrará todas sus muestras y archivos de datos.`)) {
+      return;
+    }
+    setAddWordBusy(true);
+    setAddWordMsg(null);
+    try {
+      await fetchAdminDeleteWord(wordId, apiUrl);
+      setAddWordMsg(`Palabra "${wordId}" eliminada`);
+      const updated = await refreshWords();
+      if (updated.length) {
+        setSelectedWord(updated[0].id);
+      } else {
+        setSelectedWord('');
+      }
+    } catch (err) {
+      setAddWordMsg(`Error: ${err.message}`);
+    } finally {
+      setAddWordBusy(false);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto bg-canvas px-6 py-8">
       <div>
@@ -210,6 +235,26 @@ export default function AdminPanel({ apiUrl }) {
             </div>
           )}
           <p className="text-xs text-text-secondary mt-2">Palabras disponibles: {words.length}</p>
+          {words.length > 0 && (
+            <div className="mt-4 border-t border-canvas-muted pt-4">
+              <h4 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">Eliminar señas</h4>
+              <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto">
+                {words.map((w) => (
+                  <div key={w.id} className="flex items-center gap-2 bg-canvas border border-canvas-muted rounded-lg pl-3 pr-2 py-1 text-xs">
+                    <span className="text-text font-medium">{w.label}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteWord(w.id)}
+                      className="text-red-500 hover:text-red-700 font-bold hover:bg-red-50 rounded px-1.5 py-0.5 ml-1"
+                      title={`Eliminar ${w.label}`}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Step 2: Capture */}
@@ -240,7 +285,7 @@ export default function AdminPanel({ apiUrl }) {
                 {recording && (
                   <div className="absolute top-3 left-3 flex items-center gap-2 bg-red-600 text-white text-xs font-semibold px-3 py-1.5 rounded-full">
                     <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
-                    GRABANDO
+                    GRABANDO · {frameCount} frames
                   </div>
                 )}
               </div>

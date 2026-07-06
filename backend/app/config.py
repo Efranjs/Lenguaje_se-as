@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # Rendimiento: GPU (TensorFlow LSTM) + MediaPipe más ligero
     lsp_use_gpu: bool = True
     lsp_gpu_memory_growth: bool = True
-    mediapipe_model_complexity: int = 0  # 0=rápido, 1=balance, 2=preciso
+    mediapipe_model_complexity: int = 1  # 0=rápido, 1=balance, 2=preciso
     frame_max_width: int = 400
     # Si true, descarta frames mientras MediaPipe procesa (rompe la secuencia de señas)
     inference_skip_if_busy: bool = False
