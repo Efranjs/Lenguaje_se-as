@@ -32,8 +32,8 @@ export function useHandOverlay({ enabled, videoRef, canvasRef, videoReady }) {
     };
   }, [enabled, videoReady, videoRef, canvasRef]);
 
-  const pushLandmarks = useCallback((landmarks, detected) => {
-    rendererRef.current?.setLandmarks(landmarks ?? {}, detected);
+  const pushLandmarks = useCallback((landmarks, detected, prediction) => {
+    rendererRef.current?.setLandmarks(landmarks ?? {}, detected, prediction);
   }, []);
 
   return { pushLandmarks };

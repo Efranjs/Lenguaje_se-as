@@ -380,6 +380,7 @@ function DetectionView({
   const overlayRef = useRef(null);
   const streamRef = useRef(null);
   const wsRef = useRef(null);
+  const lastPredictionRef = useRef(null);
   const [sentence, setSentence] = useState([]);
   const [realtimePrediction, setRealtimePrediction] = useState(null);
   const [words, setWords] = useState([]);
@@ -440,7 +441,7 @@ function DetectionView({
 
   const onLocalLandmarks = useCallback(
     (landmarks, detected) => {
-      pushLandmarks(landmarks, detected);
+      pushLandmarks(landmarks, detected, lastPredictionRef.current);
       setLocalHandsDetected(detected);
       setHasLandmarks(
         (landmarks?.left_hand?.length ?? 0) > 0 ||
@@ -470,6 +471,18 @@ function DetectionView({
         }));
         setWords(mapped.filter((w) => w.confidence >= confidenceThreshold));
       }
+      const lp = data.last_prediction;
+      if (lp) {
+        lastPredictionRef.current = {
+          label: lp.label,
+          confidence: lp.confidence,
+          accepted: lp.accepted,
+          timestamp: Date.now(),
+        };
+      } else if (data.hands_detected === false) {
+        lastPredictionRef.current = null;
+      }
+
       if (!localHandsEnabled) {
         const detected = Boolean(data.hands_detected);
         setHandsDetected(detected);
@@ -478,7 +491,7 @@ function DetectionView({
           (lm?.left_hand?.length ?? 0) > 0 || (lm?.right_hand?.length ?? 0) > 0;
         setHasLandmarks(anyPoints);
         if (showHandLandmarks) {
-          pushLandmarks(lm, detected);
+          pushLandmarks(lm, detected, lastPredictionRef.current);
         }
       } else {
         setHandsDetected(localHandsDetected);
@@ -486,7 +499,6 @@ function DetectionView({
       setApiMessage(data.message || null);
       setCaptureHint(data.capture?.hint ?? null);
 
-      const lp = data.last_prediction;
       if (lp && lp.accepted === false) {
         setLastRejected(`${lp.label} (${lp.confidence}% — sube umbral o repite la seña)`);
       } else if (lp?.accepted) {

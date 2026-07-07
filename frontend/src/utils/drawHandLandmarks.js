@@ -61,11 +61,12 @@ export class HandOverlayRenderer {
     this.rafId = null;
   }
 
-  setLandmarks(landmarks, handsDetected) {
+  setLandmarks(landmarks, handsDetected, prediction) {
     this.handsDetected = handsDetected;
     this.targetLeft = landmarks?.left_hand ?? [];
     this.targetRight = landmarks?.right_hand ?? [];
     this.targetFace = landmarks?.face ?? [];
+    this.prediction = prediction;
   }
 
   start() {
@@ -95,6 +96,7 @@ export class HandOverlayRenderer {
     this.targetLeft = [];
     this.targetRight = [];
     this.targetFace = [];
+    this.prediction = null;
   }
 
   paint() {
@@ -121,6 +123,54 @@ export class HandOverlayRenderer {
     }
     if (this.displayRight.length) {
       drawPointCloud(ctx, this.displayRight, w, h, STYLE.handDot, STYLE.handRadius);
+    }
+
+    // Dibujar burbuja de predicción cerca de la mano activa
+    if (this.prediction && (Date.now() - this.prediction.timestamp < 2000)) {
+      let handPoint = null;
+      if (this.displayRight.length && this.displayRight[0]) {
+        handPoint = this.displayRight[0];
+      } else if (this.displayLeft.length && this.displayLeft[0]) {
+        handPoint = this.displayLeft[0];
+      }
+
+      if (handPoint) {
+        const text = this.prediction.accepted
+          ? `✓ ${this.prediction.label.toUpperCase()} (${this.prediction.confidence}%)`
+          : `⚠ ${this.prediction.label.toUpperCase()} (${this.prediction.confidence}% - SUBE UMBRAL)`;
+
+        ctx.save();
+        // Dado que el canvas tiene -scale-x-100 en CSS, el texto se dibujaría al revés.
+        // Invertimos el eje X en el contexto para corregirlo:
+        ctx.translate(w, 0);
+        ctx.scale(-1, 1);
+
+        const textX = (1 - handPoint.x) * w;
+        const textY = handPoint.y * h;
+
+        ctx.font = 'bold 11px sans-serif';
+        const textWidth = ctx.measureText(text).width;
+        const bubbleW = textWidth + 24;
+        const bubbleH = 26;
+
+        // Dibujar burbuja
+        ctx.fillStyle = this.prediction.accepted ? 'rgba(16, 185, 129, 0.92)' : 'rgba(245, 158, 11, 0.92)';
+        ctx.beginPath();
+        if (ctx.roundRect) {
+          ctx.roundRect(textX - bubbleW / 2, textY - 45, bubbleW, bubbleH, 6);
+        } else {
+          ctx.rect(textX - bubbleW / 2, textY - 45, bubbleW, bubbleH);
+        }
+        ctx.fill();
+
+        // Dibujar texto
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, textX, textY - 32);
+
+        ctx.restore();
+      }
     }
   }
 }
